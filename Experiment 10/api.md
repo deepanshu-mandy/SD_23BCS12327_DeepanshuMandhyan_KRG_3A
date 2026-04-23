@@ -1,123 +1,203 @@
-# API Design — Food Delivery Platform
+**API Design
+Food Delivery Platform**
 
-## Versioning strategy
+Versioning Strategy
 
-- Use URI versioning: `/v1/...` for first stable contract. Version increments occur when breaking changes are introduced.
-- Maintain backward compatibility: add new fields optionally; deprecate old endpoints with migration window.
+We use URI-based versioning (e.g., /v1/...) for all endpoints.
+Any breaking change results in a new version, while non-breaking updates (like adding optional fields) are introduced without affecting existing clients.
 
-## Auth
+Older versions are supported for a limited time, giving developers enough room to migrate before deprecation.
 
-- All APIs require `Authorization: Bearer <JWT>` except public endpoints.
-- Use short-lived access tokens (15m) + refresh tokens (rotating).
+Authentication
 
-## Idempotency
+Most APIs require authentication using a JWT:
 
-- All mutating requests that can be retried (order creation, payment) must accept `Idempotency-Key` header.
-- Server stores idempotency record (key, request-hash, response) for TTL (24h) for safe retry.
+Authorization: Bearer <JWT>
 
-## Rate limiting
+We use:
 
-- Global per-IP and per-user quotas. Default: 100 requests/min per user; 1000 requests/min per IP during surge windows tuned by AB tests.
-- Use token bucket implemented in Redis with local cache of tokens for low-latency checks.
-- Strict limits on payment/order creation endpoints (e.g., 10 order attempts/hour per user).
+Short-lived access tokens (15 minutes)
+Rotating refresh tokens for session continuity
 
-## Endpoints (representative)
+Public endpoints (like browsing restaurants) may not require authentication.
 
-### 1) Search restaurants
+Idempotency
 
-- GET /v1/restaurants?lat={lat}&lng={lng}&cuisine={}&q={}&limit=20&offset=0
-- 200 OK
-- Response (excerpt):
-  {
-    "items": [
-      {"id":"r_1","name":"The Spice","rating":4.3,"eta_min":20,"eta_max":30}
-    ],
-    "count": 123
+To prevent duplicate actions during retries (especially for orders and payments), we use an Idempotency-Key.
+
+Clients must send this key in request headers for critical operations.
+The server stores the request hash and response for 24 hours.
+If the same request is retried, the server returns the original response instead of creating duplicates.
+Rate Limiting
+
+To keep the system stable under load:
+
+Per-user limit: 100 requests/minute
+Per-IP limit: 1000 requests/minute (adjustable during high traffic)
+
+Sensitive endpoints (like order creation or payments) have stricter limits:
+
+Example: max 10 order attempts per hour per user
+
+We use a token bucket approach backed by Redis for efficient rate control.
+
+Core Endpoints
+1. Search Restaurants
+GET /v1/restaurants?lat={lat}&lng={lng}&cuisine={}&q={}&limit=20&offset=0
+
+Response (200 OK):
+
+{
+  "items": [
+    {
+      "id": "r_1",
+      "name": "The Spice",
+      "rating": 4.3,
+      "eta_min": 20,
+      "eta_max": 30
+    }
+  ],
+  "count": 123
+}
+
+Errors:
+
+400 – Invalid coordinates
+429 – Rate limit exceeded
+2. Get Menu
+GET /v1/restaurants/{restaurant_id}/menu
+
+Returns menu sections, items, and modifiers.
+
+Caching:
+
+Cached via CDN + Redis (60 seconds)
+Updates trigger cache invalidation using pub/sub
+3. Cart (Optional Server-Side)
+POST /v1/cart
+
+Request:
+
+{
+  "userId": "u_1",
+  "items": [
+    {"menuItemId": "m_1", "qty": 2}
+  ],
+  "coupon": "SAVE50"
+}
+
+Response:
+A cart preview with pricing breakdown.
+
+4. Create Order
+POST /v1/orders
+
+Headers:
+
+Authorization (required)
+Idempotency-Key (required)
+
+Request:
+
+{
+  "user_id": "u_1",
+  "restaurant_id": "r_1",
+  "items": [
+    {"menu_item_id": "m_1", "quantity": 2}
+  ],
+  "address_id": "addr_1",
+  "payment_method": "CARD",
+  "tip": 200
+}
+
+Success (201 Created):
+
+{
+  "order_id": "o_123",
+  "status": "CONFIRMED",
+  "estimated_pickup_minutes": 12,
+  "estimated_delivery_minutes": 25
+}
+
+Possible errors:
+
+400 – Invalid request
+402 – Payment failed
+409 – Idempotency conflict
+429 – Too many requests
+500 – Server error
+
+If the same request is retried with the same idempotency key, the same order_id is returned.
+
+5. Payment Webhooks
+POST /v1/payments/webhook
+
+Used by the payment service provider (PSP).
+
+Validate request using HMAC signature
+Update internal payment/order status
+Respond quickly with 200 OK
+Handle heavy processing asynchronously via background jobs
+6. Order Status & Tracking
+GET /v1/orders/{order_id}
+GET /v1/orders/{order_id}/tracking
+
+For real-time tracking, we use WebSockets:
+
+wss://api.example.com/v1/realtime?token=<ws-token>
+
+Clients subscribe to:
+
+order:<order_id>
+
+This provides live updates like order status and delivery partner location.
+
+7. Delivery Partner APIs
+
+Update availability:
+
+POST /v1/partners/{partner_id}/availability
+
+Send location updates:
+
+POST /v1/partners/{partner_id}/location
+{
+  "lat": 28.61,
+  "lng": 77.20,
+  "timestamp": 1710000000
+}
+Updates are rate-limited (e.g., once per second)
+Data is streamed via Redis pub/sub to real-time systems
+Error Handling
+
+We follow standard HTTP status codes:
+
+200 – Success
+201 – Resource created
+202 – Accepted for async processing
+400 – Bad request
+401 – Unauthorized
+403 – Forbidden
+404 – Not found
+409 – Conflict
+422 – Business rule violation (e.g., restaurant closed)
+429 – Too many requests
+500 – Internal server error
+Example Order Response
+{
+  "order_id": "o_123",
+  "status": "PREPARING",
+  "items": [
+    {"name": "Paneer Tikka", "qty": 1, "price": 24900}
+  ],
+  "pricing": {
+    "subtotal": 24900,
+    "tax": 1245,
+    "delivery": 3000,
+    "total": 29145
   }
-- Errors: 400 Bad Request (invalid coords), 429 Rate limit
-
-### 2) Get Menu
-
-- GET /v1/restaurants/{restaurant_id}/menu
-- Response: JSON with sections, items, modifiers
-- Cache: CDN + Redis for 60s; menu updates invalidate caches via pub/sub
-
-### 3) Cart (client-side object; optional server side)
-
-- POST /v1/cart
-  - Body: {userId, items: [{menuItemId, qty, modifiers}], coupon}
-  - Response: cart preview with price breakdown
-
-### 4) Create Order
-
-- POST /v1/orders
-- Headers: `Authorization`, `Idempotency-Key` (required)
-- Body (example):
-  {
-    "user_id":"u_1",
-    "restaurant_id":"r_1",
-    "items":[{"menu_item_id":"m_1","quantity":2}],
-    "address_id":"addr_1",
-    "payment_method":"CARD",
-    "tip": 200
-  }
-- Success response (201 Created):
-  {
-    "order_id":"o_123",
-    "status":"CONFIRMED",
-    "estimated_pickup_minutes":12,
-    "estimated_delivery_minutes":25
-  }
-- Status codes: 201 Created, 400 Bad Request (validation), 402 Payment Required, 409 Conflict (idempotency collision), 429 Rate limit, 500 Internal Error
-- Idempotency handling: server returns same `order_id` & response for repeated requests with same `Idempotency-Key` and identical payload.
-
-### 5) Payment webhooks
-
-- POST /v1/payments/webhook
-- External PSP calls this; validate signature. Map PSP event to internal payment status, update order/payment records.
-- Respond 200 OK quickly; do minimal processing and enqueue detailed reconciliation job.
-
-### 6) Order status / Tracking
-
-- GET /v1/orders/{order_id}
-- GET /v1/orders/{order_id}/tracking (real-time via WebSocket preferred)
-- WebSocket endpoint: wss://api.example.com/v1/realtime?token=<ws-token>
-  - Subscribe to `order:<order_id>` channel for live status and courier lat/lng.
-
-### 7) Delivery partner endpoints
-
-- POST /v1/partners/{partner_id}/availability
-- POST /v1/partners/{partner_id}/location {lat,lng,timestamp}
-- Partner location updates are rate-limited (e.g., 1s) and pushed to Redis pub/sub and real-time gateway.
-
-## Error handling and status codes (summary)
-
-- 200 OK: GET success
-- 201 Created: resource created (order)
-- 202 Accepted: async processing initiated (webhook accepted)
-- 400 Bad Request: invalid input
-- 401 Unauthorized: missing/invalid token
-- 403 Forbidden: operation forbidden
-- 404 Not Found: resource missing
-- 409 Conflict: duplicate idempotency key with conflicting payload
-- 422 Unprocessable Entity: business rule violation (restaurant closed)
-- 429 Too Many Requests: rate limiting
-- 500 Internal Server Error: unexpected failure
-
-## Payload examples
-
-- Order response (example):
-  {
-    "order_id":"o_123",
-    "status":"PREPARING",
-    "items":[{"name":"Paneer Tikka","qty":1,"price":24900}],
-    "pricing": {"subtotal":24900,"tax":1245,"delivery":3000,"total":29145}
-  }
-
-## Security considerations
-
-- For payments, never log full card details. Use PSP tokens.
-- Webhooks validated using HMAC signatures.
-
----
-End of API spec
+}
+Security Notes
+Never store or log full card details
+Use tokenized payments via PSP
+Always verify webhook authenticity using signatures
